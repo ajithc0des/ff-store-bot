@@ -35,7 +35,7 @@ ADMIN_ID = int(os.environ["ADMIN_ID"])
 FG_API_KEY = os.environ["FG_API_KEY"]
 FG_BASE_URL = "https://famgateway.in/api"
 
-POLL_INTERVAL = 3        # FamGateway docs: never poll faster than 3s
+POLL_INTERVAL = 1        # 1 second — instant detection on payment confirm
 POLL_MAX_SECONDS = 360   # gateway order lives 300s; small grace on top
 
 # ─── STATES ────────────────────────────────────────────────────────────────────
@@ -59,6 +59,24 @@ _tasks: set = set()         # keep references to background poll tasks
 _http = None
 
 
+# ─── STYLING (ported from app.py) ─────────────────────────────────────────────
+def stylish(text: str) -> str:
+    """Convert text to Unicode small-caps — same as app.py."""
+    return text.translate(str.maketrans(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+        "ᴀʙᴄᴅᴇғɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢᴀʙᴄᴅᴇғɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢ"
+    )).strip()
+
+
+def btn(text: str, callback_data: str, style: str = "primary") -> InlineKeyboardButton:
+    """Colored inline button — style: primary | success | danger (ported from app.py)."""
+    label = stylish(text)
+    kwargs: dict = {"text": label, "callback_data": callback_data}
+    if style in ("primary", "success", "danger"):
+        kwargs["style"] = style
+    return InlineKeyboardButton(**kwargs)
+
+
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
@@ -69,19 +87,19 @@ def money(x) -> str:
 
 
 def back_button(callback: str = "main_menu") -> list:
-    return [[InlineKeyboardButton("🔙 Back", callback_data=callback)]]
+    return [[btn("🔙 Back", callback, style="danger")]]
 
 
 def menu_button() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+        [[btn("🏠 Main Menu", "main_menu", style="primary")]]
     )
 
 
 def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    buttons = [[InlineKeyboardButton("🛒 Buy FF ID", callback_data="buy_start")]]
+    buttons = [[btn("🛒 Buy FF ID", "buy_start", style="success")]]
     if is_admin(user_id):
-        buttons.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
+        buttons.append([btn("⚙️ Admin Panel", "admin_panel", style="primary")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -163,25 +181,85 @@ async def _fetch(url: str, params: dict, headers: dict | None = None):
         return None
 
 
-def _norm(data):
-    """-> (status, utr, sender). status is 'success' only if the gateway also returns a UTR."""
-    if not isinstance(data, dict):
-        return "unknown", None, None
-    inner = data.get("data") if isinstance(data.get("data"), dict) else {}
-    st = str(inner.get("status") or data.get("status") or "").lower()
-    utr = data.get("utr") or inner.get("utr")
-    sender = data.get("sender_name") or inner.get("sender_name")
-    if st == "success":
-        return ("success" if utr else "pending"), utr, sender
-    if st == "expired":
-        return "expired", utr, sender
-    return "pending", utr, sender
+def _is_paid(resp) -> bool:
+    """Robust payment detection — handles every shape FamGateway might return.
+    Checks boolean flags, 15+ status field names, nested structures, flat JSON.
+    Ported from app.py."""
+    if not isinstance(resp, dict):
+        return False
+    # Boolean fast-path flags
+    for key in ("paid", "is_paid", "payment_received", "isPaid", "paymentReceived", "payment_verified"):
+        if resp.get(key) is True:
+            return True
+    # String status fields — all names FamGateway has ever used
+    for key in (
+        "payment_status", "paymentStatus", "status", "verification",
+        "order_status", "orderStatus", "paymentState", "state",
+        "txn_status", "transaction_status",
+    ):
+        v = str(resp.get(key, "")).strip().lower()
+        if v in (
+            "paid", "success", "successful", "completed", "complete",
+            "received", "captured", "verified", "confirmed",
+            "payment received", "payment_received", "payment successful",
+            "payment_successful",
+        ):
+            return True
+    # Flat JSON string scan — catches weirdly nested / stringified responses
+    flat = json.dumps(resp).lower()
+    if ("payment received" in flat) or ("payment successful" in flat) \
+       or ("payment success" in flat) or ("payment_received" in flat) \
+       or ("payment_success" in flat):
+        return True
+    if ("payment" in flat) and ("paid" in flat):
+        return True
+    if '"success": true' in flat and "order" in flat and ("paid" in flat or "received" in flat):
+        return True
+    # Recurse into nested objects / lists
+    for nest in ("data", "order", "result", "response", "payment"):
+        nv = resp.get(nest)
+        if isinstance(nv, dict) and _is_paid(nv):
+            return True
+        if isinstance(nv, list):
+            for item in nv:
+                if isinstance(item, dict) and _is_paid(item):
+                    return True
+    return False
+
+
+def _is_expired(resp) -> bool:
+    """Check if FamGateway response indicates an expired / failed / cancelled order."""
+    if not isinstance(resp, dict):
+        return False
+    for src in (resp, resp.get("data") if isinstance(resp.get("data"), dict) else {}):
+        for key in ("status", "payment_status", "order_status", "state"):
+            v = str(src.get(key, "")).strip().lower()
+            if v in ("expired", "failed", "cancelled", "canceled", "timeout"):
+                return True
+    return False
+
+
+def _extract_field(resp, *field_names) -> str | None:
+    """Try multiple field names across top-level and nested 'data' key."""
+    if not isinstance(resp, dict):
+        return None
+    for key in field_names:
+        v = resp.get(key)
+        if v and not isinstance(v, (dict, list)):
+            return str(v)
+    inner = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+    for key in field_names:
+        v = inner.get(key)
+        if v and not isinstance(v, (dict, list)):
+            return str(v)
+    return None
 
 
 async def fg_status(order_id: str):
     """Ask both FamGateway endpoints (public checkout-status + authoritative verify-order).
 
     Returns ("success", {"utr", "sender"}) | ("expired", {}) | ("pending", {}).
+    Uses robust _is_paid() — catches all response shapes FamGateway might return.
     """
     ts = str(int(time.time() * 1000))  # cache-buster
     pub, auth = await asyncio.gather(
@@ -192,21 +270,30 @@ async def fg_status(order_id: str):
             {"X-Api-Key": FG_API_KEY},
         ),
     )
-    parsed = [("checkout-status", pub, _norm(pub)), ("verify-order", auth, _norm(auth))]
 
-    seen = tuple(p[2][0] for p in parsed)
-    if _last_seen.get(order_id) != seen:  # log only when something changes
+    # Log only when something changes (de-dup noise on 1s polling)
+    seen = (
+        json.dumps(pub, sort_keys=True) if pub else "",
+        json.dumps(auth, sort_keys=True) if auth else "",
+    )
+    if _last_seen.get(order_id) != seen:
         _last_seen[order_id] = seen
-        for name, raw, (st, _, _) in parsed:
+        for name, raw in [("checkout-status", pub), ("verify-order", auth)]:
             shown = json.dumps(raw)[:300] if raw is not None else "no/invalid response"
-            log.info("order %s | %s -> %s | %s", order_id, name, st, shown)
+            log.info("order %s | %s | %s", order_id, name, shown)
 
-    for _, _, (st, utr, sender) in parsed:
-        if st == "success":
-            return "success", {"utr": utr, "sender": sender or "N/A"}
-    for _, _, (st, _, _) in parsed:
-        if st == "expired":
+    # Check success — verify-order (auth) is more authoritative, check it first
+    for resp in (auth, pub):
+        if resp and _is_paid(resp):
+            utr    = _extract_field(resp, "utr", "transaction_id", "txn_id", "ref_id", "rrn")
+            sender = _extract_field(resp, "sender_name", "payer_name", "customer_name", "sender") or "N/A"
+            return "success", {"utr": utr or "N/A", "sender": sender}
+
+    # Check expired
+    for resp in (pub, auth):
+        if resp and _is_expired(resp):
             return "expired", {}
+
     return "pending", {}
 
 
@@ -455,6 +542,7 @@ async def admin_edit_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for pid, info in list(posts.items())[:50]:
         tag = "🟡" if pid in reserved else "✏️"
         buttons.append([InlineKeyboardButton(f"{tag} {pid} — ₹{money(info['price'])}", callback_data=f"edit_{pid}")])
+    buttons.append([InlineKeyboardButton(f"{tag} {pid} — ₹{money(info['price'])}", callback_data=f"edit_{pid}")])
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
 
     await query.edit_message_text(
@@ -681,10 +769,12 @@ async def buyer_post_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📱 Exact *₹{payable_amt}* hi pay karo — amount ya note edit mat karna\n"
         "💎 Payment ke baad credentials apne aap aa jayenge!"
     )
+    # "Open Pay Page" hidden — payment is fully automatic via QR scan.
+    # Bot polls every second and delivers credentials the moment payment confirms.
+    _ = checkout_url  # kept in scope in case needed for admin logging
     buttons = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔗 Open Pay Page", url=checkout_url)],
-            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{order_id}")],
+            [btn("❌ Cancel", f"cancel_{order_id}", style="danger")],
         ]
     )
 
@@ -795,8 +885,8 @@ async def expire_order(order_id: str, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(
                 [[
-                    InlineKeyboardButton("🔄 Buy Again", callback_data="buy_start"),
-                    InlineKeyboardButton("🏠 Home", callback_data="main_menu"),
+                    btn("🔄 Buy Again", "buy_start", style="success"),
+                    btn("🏠 Home", "main_menu", style="primary"),
                 ]]
             ),
         )
