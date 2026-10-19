@@ -69,12 +69,11 @@ def stylish(text: str) -> str:
 
 
 def btn(text: str, callback_data: str, style: str = "primary") -> InlineKeyboardButton:
-    """Colored inline button — style: primary | success | danger (ported from app.py)."""
+    """Styled inline button — applies stylish() Unicode text transform.
+    style param kept for call-site readability but NOT passed to InlineKeyboardButton
+    (ptb 21.6 does not support it and it crashes with TypeError)."""
     label = stylish(text)
-    kwargs: dict = {"text": label, "callback_data": callback_data}
-    if style in ("primary", "success", "danger"):
-        kwargs["style"] = style
-    return InlineKeyboardButton(**kwargs)
+    return InlineKeyboardButton(text=label, callback_data=callback_data)
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
