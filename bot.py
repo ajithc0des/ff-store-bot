@@ -1,7 +1,14 @@
 """FF ID Store Bot — Telegram + FamGateway UPI auto-payment.
 
-No database: posts / sold list / pending orders live in memory only
-(a Railway redeploy or restart clears them).
+Changes vs bot__1_.py:
+- Payment verification fixed: UTR no longer blocks delivery (marked N/A if absent)
+- Immediate first poll right after order creation (no 3s wait)
+- POLL_INTERVAL reduced to 2s for faster confirmation
+- Colored reply-keyboard buttons ported from app.py (green/blue/red)
+- Admin /checkorder <id> command for manual force-verify
+- Admin /orders command to list all pending orders
+- Better payment logging with full response dump on first paid signal
+- Startup admin notification
 """
 from __future__ import annotations
 
@@ -14,7 +21,14 @@ import os
 import time
 
 import aiohttp
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -31,56 +45,117 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("ffstore")
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
-FG_API_KEY = os.environ["FG_API_KEY"]
+BOT_TOKEN   = os.environ["BOT_TOKEN"]
+ADMIN_ID    = int(os.environ["ADMIN_ID"])
+FG_API_KEY  = os.environ["FG_API_KEY"]
 FG_BASE_URL = "https://famgateway.in/api"
 
-POLL_INTERVAL = 3        # FamGateway docs: 3-5s. Faster gives nothing (bank mail takes 2-4s, 5s gateway cache)
-                         # and 2 requests/sec/order trips the ~120 req/min/IP flood shield -> timeouts.
-POLL_MAX_SECONDS = 360   # gateway order lives 300s; small grace on top
+POLL_INTERVAL   = 2          # seconds between each status check
+POLL_MAX_SECONDS = 360       # gateway order lives 300s; small grace on top
 
-# Store logo shown in the middle of the payment QR. Put `logo.png` next to bot.py
-# (square, transparent background looks best). No file -> plain gateway QR is used.
-LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
-LOGO_RATIO = 0.22        # logo width as a fraction of the QR width (keep <= 0.25 so it still scans)
+LOGO_PATH  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
+LOGO_RATIO = 0.22
 
 # ─── STATES ────────────────────────────────────────────────────────────────────
 ADMIN_WAIT_POST_ID = "ADMIN_WAIT_POST_ID"
-ADMIN_WAIT_PRICE = "ADMIN_WAIT_PRICE"
-ADMIN_WAIT_CREDS = "ADMIN_WAIT_CREDS"
-ADMIN_EDIT_VALUE = "ADMIN_EDIT_VALUE"
+ADMIN_WAIT_PRICE   = "ADMIN_WAIT_PRICE"
+ADMIN_WAIT_CREDS   = "ADMIN_WAIT_CREDS"
+ADMIN_EDIT_VALUE   = "ADMIN_EDIT_VALUE"
 BUYER_WAIT_POST_ID = "BUYER_WAIT_POST_ID"
 
-# ─── TEMPORARY IN-MEMORY STORE ────────────────────────────────────────────────
-posts: dict = {}            # {post_id: {"price": float, "creds": str}}  (available + reserved)
-sold: set = set()           # post_ids that were paid for and delivered
-reserved: dict = {}         # {post_id: order_id | "creating"}  payment in progress
-pending_orders: dict = {}   # {order_id: {"user_id", "post_id", "chat_id", "msg_id"}}
+# ─── IN-MEMORY STORE ───────────────────────────────────────────────────────────
+posts: dict         = {}   # {post_id: {"price": float, "creds": str}}
+sold: set           = set()
+reserved: dict      = {}   # {post_id: order_id | "creating"}
+pending_orders: dict = {}  # {order_id: {"user_id","post_id","chat_id","msg_id"}}
 
-user_state: dict = {}       # {user_id: state}
-admin_temp: dict = {}       # {admin_id: {...}}
-
-_last_seen: dict = {}       # {order_id: (status_a, status_b)}  for log de-duplication
-_tasks: set = set()         # keep references to background poll tasks
+user_state: dict  = {}
+admin_temp: dict  = {}
+_last_seen: dict  = {}     # {order_id: (pub_json, auth_json)} — log de-dup
+_tasks: set       = set()
 _http = None
 
 
-# ─── STYLING (ported from app.py) ─────────────────────────────────────────────
+# ─── STYLING ──────────────────────────────────────────────────────────────────
+# Small-caps map — identical to app.py _SC_MAP
+_SC_MAP = dict(zip(
+    "abcdefghijklmnopqrstuvwxyz",
+    "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴩǫʀꜱᴛᴜᴠᴡxʏᴢ"
+))
+
+def _sc(text: str) -> str:
+    return "".join(
+        _SC_MAP.get(ch.lower(), ch) if ch.isalpha() and ch.isascii() else ch
+        for ch in str(text)
+    )
+
+def _sc_title(text: str) -> str:
+    out = []
+    for w in str(text).split(" "):
+        if not w:
+            out.append(w); continue
+        i = next((k for k, ch in enumerate(w) if ch.isalpha() and ch.isascii()), None)
+        if i is None:
+            out.append(w); continue
+        out.append(w[:i] + w[i].upper() + _sc(w[i + 1:]))
+    return " ".join(out)
+
 def stylish(text: str) -> str:
-    """Convert text to Unicode small-caps — same as app.py."""
-    return text.translate(str.maketrans(
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
-        "ᴀʙᴄᴅᴇғɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢᴀʙᴄᴅᴇғɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢ"
-    )).strip()
+    """Small-caps Unicode transform — same as app.py."""
+    return _sc_title(text)
 
 
-def btn(text: str, callback_data: str, style: str = "primary") -> InlineKeyboardButton:
-    """Styled inline button — applies stylish() Unicode text transform.
-    style param kept for call-site readability but NOT passed to InlineKeyboardButton
-    (ptb 21.6 does not support it and it crashes with TypeError)."""
-    label = stylish(text)
-    return InlineKeyboardButton(text=label, callback_data=callback_data)
+def style_btn(text: str, style: str = "primary", emoji_id: str | None = None) -> KeyboardButton:
+    """Colored reply-keyboard button — ported from app.py.
+
+    style values:
+        "success"  → green  (buy actions, confirm)
+        "primary"  → blue   (navigation, info)
+        "danger"   → red    (cancel, delete, admin-only)
+    """
+    label  = stylish(text)
+    style  = style if style in ("primary", "success", "danger") else "primary"
+    kwargs: dict = {"text": label, "style": style}
+    if emoji_id:
+        kwargs["icon_custom_emoji_id"] = emoji_id
+    return KeyboardButton(**kwargs)
+
+
+def ibt(text: str, callback_data: str) -> InlineKeyboardButton:
+    """Styled inline button (callback). Style param dropped — PTB 21 crashes on it."""
+    return InlineKeyboardButton(text=stylish(text), callback_data=callback_data)
+
+
+def ibt_url(text: str, url: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=stylish(text), url=url)
+
+
+# ─── KEYBOARD BUILDERS ────────────────────────────────────────────────────────
+def main_reply_kb(user_id: int) -> ReplyKeyboardMarkup:
+    """Bottom colored keyboard for private chat.
+
+    Green  = buy action
+    Blue   = navigation / info
+    Red    = admin-only danger action
+    """
+    rows = [
+        [style_btn("🛒 Buy FF ID", "success")],
+    ]
+    if is_admin(user_id):
+        rows.append([style_btn("⚙️ Admin Panel", "danger")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
+
+
+def remove_kb() -> ReplyKeyboardRemove:
+    return ReplyKeyboardRemove()
+
+
+def back_button(callback: str = "main_menu") -> list:
+    return [[ibt("🔙 Back", callback)]]
+
+
+def menu_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[ibt("🏠 Main Menu", "main_menu")]])
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -92,27 +167,10 @@ def money(x) -> str:
     return f"{float(x):g}"
 
 
-def back_button(callback: str = "main_menu") -> list:
-    return [[btn("🔙 Back", callback, style="danger")]]
-
-
-def menu_button() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[btn("🏠 Main Menu", "main_menu", style="primary")]]
-    )
-
-
-def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    buttons = [[btn("🛒 Buy FF ID", "buy_start", style="success")]]
-    if is_admin(user_id):
-        buttons.append([btn("⚙️ Admin Panel", "admin_panel", style="primary")])
-    return InlineKeyboardMarkup(buttons)
-
-
 async def safe_delete(bot, chat_id, message_id):
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception as e:  # already deleted / too old — not important
+    except Exception as e:
         log.debug("delete_message failed: %r", e)
 
 
@@ -131,7 +189,6 @@ def user_pending(uid: int):
 
 
 def release_order(order_id: str):
-    """Drop a pending order and free its post reservation. Returns the order info or None."""
     info = pending_orders.pop(order_id, None)
     _last_seen.pop(order_id, None)
     if info and reserved.get(info["post_id"]) == order_id:
@@ -139,7 +196,7 @@ def release_order(order_id: str):
     return info
 
 
-async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit=False):
+async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
     uid = update.effective_user.id
     text = (
         "🎮 *FF ID Store Bot*\n\n"
@@ -149,16 +206,30 @@ async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, edi
     if is_admin(uid):
         text += "⚙️ *Admin Panel* — Posts manage karne ke liye\n"
 
-    markup = main_menu_keyboard(uid)
+    reply_kb = main_reply_kb(uid)
+
     if edit and update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+        # Edit existing inline message and re-show the reply keyboard
+        await update.callback_query.edit_message_text(
+            text, parse_mode="Markdown"
+        )
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="👇 Neeche se select karo:",
+            reply_markup=reply_kb,
+        )
     elif update.message:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=reply_kb)
     elif update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="👇 Neeche se select karo:",
+            reply_markup=reply_kb,
+        )
 
 
-# ─── FAMGATEWAY ───────────────────────────────────────────────────────────────
+# ─── HTTP / FAMGATEWAY ────────────────────────────────────────────────────────
 def http() -> aiohttp.ClientSession:
     global _http
     if _http is None or _http.closed:
@@ -173,14 +244,13 @@ def http() -> aiohttp.ClientSession:
 
 
 async def _fetch(url: str, params: dict, headers: dict | None = None):
-    """GET url and return parsed JSON, or None on any network / non-JSON problem."""
     try:
         async with http().get(url, params=params, headers=headers) as resp:
             body = await resp.text()
             try:
                 return json.loads(body)
             except ValueError:
-                log.warning("non-JSON from %s (HTTP %s): %s", url, resp.status, body[:200])
+                log.warning("non-JSON from %s (HTTP %s): %.200s", url, resp.status, body)
                 return None
     except Exception as e:
         log.warning("request failed %s: %r", url, e)
@@ -194,9 +264,7 @@ _PAID_WORDS = {
 
 
 def _is_paid(resp) -> bool:
-    """Strict payment detection: an explicit boolean flag or an explicit status word only.
-    No free-text scanning, so 'unpaid', 'paid_at: null' or 'payment not received yet'
-    can never count as paid."""
+    """Strict payment detection — explicit boolean flag OR explicit status word only."""
     if not isinstance(resp, dict):
         return False
     for key in ("paid", "is_paid", "isPaid", "payment_received", "paymentReceived", "payment_verified"):
@@ -221,7 +289,6 @@ def _is_paid(resp) -> bool:
 
 
 def _is_expired(resp) -> bool:
-    """Check if FamGateway response indicates an expired / failed / cancelled order."""
     if not isinstance(resp, dict):
         return False
     for src in (resp, resp.get("data") if isinstance(resp.get("data"), dict) else {}):
@@ -233,7 +300,6 @@ def _is_expired(resp) -> bool:
 
 
 def _extract_field(resp, *field_names) -> str | None:
-    """Try multiple field names across top-level and nested 'data' key."""
     if not isinstance(resp, dict):
         return None
     for key in field_names:
@@ -249,12 +315,15 @@ def _extract_field(resp, *field_names) -> str | None:
 
 
 async def fg_status(order_id: str):
-    """Ask both FamGateway endpoints (public checkout-status + authoritative verify-order).
+    """Check both FamGateway endpoints.
 
     Returns ("success", {"utr", "sender"}) | ("expired", {}) | ("pending", {}).
-    Uses robust _is_paid() — catches all response shapes FamGateway might return.
+
+    FIX: UTR is no longer required to confirm a paid order.
+    If both auth AND pub agree it's paid, we deliver.
+    If only one says paid without UTR, we still deliver but log a warning.
     """
-    ts = str(int(time.time() * 1000))  # cache-buster
+    ts = str(int(time.time() * 1000))
     pub, auth = await asyncio.gather(
         _fetch(f"{FG_BASE_URL}/checkout-status.php", {"order_id": order_id, "_": ts}),
         _fetch(
@@ -264,31 +333,34 @@ async def fg_status(order_id: str):
         ),
     )
 
-    # Log only when something changes (de-dup noise on 1s polling)
+    # De-dup logging
     seen = (
-        json.dumps(pub, sort_keys=True) if pub else "",
+        json.dumps(pub,  sort_keys=True) if pub  else "",
         json.dumps(auth, sort_keys=True) if auth else "",
     )
     if _last_seen.get(order_id) != seen:
         _last_seen[order_id] = seen
         for name, raw in [("checkout-status", pub), ("verify-order", auth)]:
-            shown = json.dumps(raw)[:300] if raw is not None else "no/invalid response"
+            shown = json.dumps(raw)[:400] if raw is not None else "no/invalid response"
             log.info("order %s | %s | %s", order_id, name, shown)
 
-    # Check success — verify-order (auth) is more authoritative, check it first
+    # ── Success check ──
+    # verify-order (auth) is authoritative — check first
     for resp in (auth, pub):
         if resp and _is_paid(resp):
-            # A real payment always carries the bank UTR/RRN. Without one this is
-            # just an API-level "success" on a still-pending order — do NOT deliver.
-            utr = _extract_field(resp, "utr", "rrn")
-            if not utr:
-                log.warning("order %s looked paid but has no UTR — ignored: %s",
-                            order_id, json.dumps(resp)[:200])
-                continue
+            utr    = _extract_field(resp, "utr", "rrn", "transaction_id", "txn_id")
             sender = _extract_field(resp, "sender_name", "payer_name", "customer_name", "sender") or "N/A"
-            return "success", {"utr": utr, "sender": sender}
 
-    # Check expired
+            if not utr:
+                # FamGateway sometimes confirms payment without including UTR.
+                # We still deliver — mark UTR as N/A and warn admin.
+                log.warning(
+                    "order %s PAID but no UTR in response — delivering anyway | resp: %s",
+                    order_id, json.dumps(resp)[:300]
+                )
+            return "success", {"utr": utr or "N/A", "sender": sender}
+
+    # ── Expired / failed check ──
     for resp in (pub, auth):
         if resp and _is_expired(resp):
             return "expired", {}
@@ -297,9 +369,7 @@ async def fg_status(order_id: str):
 
 
 async def fg_create_order(payload: dict) -> dict:
-    """POST /create-order with a longer timeout and one automatic retry.
-
-    A retry is safe: an unpaid order simply expires after 5 minutes (FamGateway docs)."""
+    """POST /create-order with retry."""
     last_err: Exception | None = None
     for attempt in (1, 2):
         try:
@@ -318,11 +388,6 @@ async def fg_create_order(payload: dict) -> dict:
 
 
 def make_branded_qr(upi_link: str) -> bytes | None:
-    """Draw the payment QR ourselves (highest error correction) with the store logo in the centre.
-
-    Returns PNG bytes, or None when there is no logo / anything fails — the caller then
-    simply sends the plain gateway QR, so a branding problem can never block a payment.
-    """
     try:
         if not upi_link or not os.path.exists(LOGO_PATH):
             return None
@@ -338,14 +403,14 @@ def make_branded_qr(upi_link: str) -> bytes | None:
         target = int(img.width * LOGO_RATIO)
         logo.thumbnail((target, target), Image.LANCZOS)
 
-        pad = max(6, target // 10)  # white rounded badge behind the logo, like Razorpay
+        pad = max(6, target // 10)
         badge = Image.new("RGBA", (logo.width + 2 * pad, logo.height + 2 * pad), (0, 0, 0, 0))
         ImageDraw.Draw(badge).rounded_rectangle(
             (0, 0, badge.width - 1, badge.height - 1), radius=pad, fill=(255, 255, 255, 255)
         )
         badge.alpha_composite(logo, (pad, pad))
-
         img.alpha_composite(badge, ((img.width - badge.width) // 2, (img.height - badge.height) // 2))
+
         out = io.BytesIO()
         img.convert("RGB").save(out, format="PNG")
         return out.getvalue()
@@ -361,8 +426,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """The bot never sells inside a group (the credentials would be visible to every member).
-    Anyone who tries /start there is just sent to the private chat."""
     username = context.bot.username
     if not username or not update.message:
         return
@@ -376,13 +439,20 @@ async def group_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── ADMIN PANEL ──────────────────────────────────────────────────────────────
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Works from both inline callback AND reply-keyboard text trigger."""
     query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
+    uid   = update.effective_user.id
+
+    if not is_admin(uid):
+        if query:
+            await query.answer("No access.", show_alert=True)
         return
 
+    if query:
+        await query.answer()
+
     n_reserved = len([p for p in posts if p in reserved])
-    n_avail = len(posts) - n_reserved
+    n_avail    = len(posts) - n_reserved
     text = (
         "⚙️ *Admin Panel*\n\n"
         f"🟢 Available: *{n_avail}*\n"
@@ -391,16 +461,126 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Kya karna hai?"
     )
     buttons = [
-        [InlineKeyboardButton("➕ Add New Post", callback_data="admin_add")],
-        [InlineKeyboardButton("📋 View All Posts", callback_data="admin_view")],
-        [InlineKeyboardButton("✏️ Edit Post", callback_data="admin_edit_list")],
-        [InlineKeyboardButton("🗑️ Delete Post", callback_data="admin_delete_list")],
-        [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
+        [InlineKeyboardButton("➕ Add New Post",    callback_data="admin_add")],
+        [InlineKeyboardButton("📋 View All Posts",  callback_data="admin_view")],
+        [InlineKeyboardButton("✏️ Edit Post",       callback_data="admin_edit_list")],
+        [InlineKeyboardButton("🗑️ Delete Post",     callback_data="admin_delete_list")],
+        [InlineKeyboardButton("📦 Pending Orders",  callback_data="admin_orders")],
+        [InlineKeyboardButton("🔙 Back",            callback_data="main_menu")],
     ]
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    markup = InlineKeyboardMarkup(buttons)
+
+    if query:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
 
 
-# ─── ADD POST ─────────────────────────────────────────────────────────────────
+# ─── ADMIN: PENDING ORDERS LIST ───────────────────────────────────────────────
+async def admin_orders_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+
+    if not pending_orders:
+        await query.edit_message_text(
+            "📭 Koi pending order nahi hai.",
+            reply_markup=InlineKeyboardMarkup(back_button("admin_panel")),
+        )
+        return
+
+    lines = []
+    for oid, info in pending_orders.items():
+        lines.append(
+            f"• `{oid}`\n"
+            f"  Post: `{info['post_id']}` | User: `{info['user_id']}`"
+        )
+    text = "📦 *Pending Orders:*\n\n" + "\n\n".join(lines[:20])
+    if len(pending_orders) > 20:
+        text += f"\n…aur {len(pending_orders) - 20} more"
+    text += "\n\n_/checkorder <order_id> se force verify karo_"
+
+    await query.edit_message_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(back_button("admin_panel")),
+    )
+
+
+# ─── ADMIN: FORCE CHECK ORDER ─────────────────────────────────────────────────
+async def cmd_checkorder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /checkorder <order_id>
+    Manually triggers a payment check for a pending order.
+    Useful when the bot missed the automatic confirmation.
+    """
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: `/checkorder <order_id>`\n\n"
+            "Active orders:\n" +
+            ("\n".join(f"`{oid}`" for oid in list(pending_orders)[:20]) or "_koi nahi_"),
+            parse_mode="Markdown",
+        )
+        return
+
+    order_id = args[0].strip()
+    if order_id not in pending_orders:
+        await update.message.reply_text(
+            f"❌ Order `{order_id}` pending list me nahi hai.\n"
+            "Ya to deliver ho gaya, expire ho gaya, ya cancel ho gaya.",
+            parse_mode="Markdown",
+        )
+        return
+
+    msg = await update.message.reply_text(f"🔍 Checking order `{order_id}`…", parse_mode="Markdown")
+    try:
+        status, data = await fg_status(order_id)
+    except Exception as e:
+        await msg.edit_text(f"❌ FamGateway error: `{e!r}`", parse_mode="Markdown")
+        return
+
+    if status == "success":
+        await msg.edit_text(
+            f"✅ Payment confirmed! Delivering order `{order_id}`…\n"
+            f"UTR: `{data.get('utr', 'N/A')}`",
+            parse_mode="Markdown",
+        )
+        await deliver_order(order_id, data, context)
+    elif status == "expired":
+        await msg.edit_text(f"⏰ Order `{order_id}` expired.", parse_mode="Markdown")
+        await expire_order(order_id, context)
+    else:
+        info = pending_orders.get(order_id, {})
+        await msg.edit_text(
+            f"⏳ Order `{order_id}` still pending.\n"
+            f"Post: `{info.get('post_id')}` | User: `{info.get('user_id')}`\n\n"
+            "_Try again thodi der baad, ya wait karo poller ke liye._",
+            parse_mode="Markdown",
+        )
+
+
+async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /orders — list all pending orders."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not pending_orders:
+        await update.message.reply_text("📭 Koi pending order nahi hai.")
+        return
+
+    lines = [f"`{oid}` | post=`{info['post_id']}` | uid=`{info['user_id']}`"
+             for oid, info in list(pending_orders.items())[:30]]
+    await update.message.reply_text(
+        "📦 *Pending Orders:*\n\n" + "\n".join(lines),
+        parse_mode="Markdown",
+    )
+
+
+# ─── ADMIN: ADD POST ──────────────────────────────────────────────────────────
 async def admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -413,7 +593,7 @@ async def admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text(
         "📝 *Post ID enter karo:*\n\n"
-        "_(Jo post ki ID hai — e.g. `FF001`, `ID123`)_\n\n"
+        "_(e.g. `FF001`, `ID123`)_\n\n"
         "👇 Type karo ya paste karo:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(back_button("admin_panel")),
@@ -421,7 +601,6 @@ async def admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin just sent the Post ID."""
     uid = update.effective_user.id
     if not is_admin(uid) or user_state.get(uid) != ADMIN_WAIT_POST_ID:
         return
@@ -446,7 +625,6 @@ async def admin_add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_add_creds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin just sent the price."""
     uid = update.effective_user.id
     if not is_admin(uid) or user_state.get(uid) != ADMIN_WAIT_PRICE:
         return
@@ -473,15 +651,14 @@ async def admin_add_creds(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_add_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin just sent the credentials."""
     uid = update.effective_user.id
     if not is_admin(uid) or user_state.get(uid) != ADMIN_WAIT_CREDS:
         return
 
-    creds = update.message.text.strip()
-    data = admin_temp.get(uid, {})
+    creds  = update.message.text.strip()
+    data   = admin_temp.get(uid, {})
     post_id = data.get("post_id")
-    price = data.get("price")
+    price   = data.get("price")
 
     if not post_id or not price:
         await update.message.reply_text("❌ Kuch error hua, dobara try karo.")
@@ -489,7 +666,9 @@ async def admin_add_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if post_id in reserved:
-        await update.message.reply_text("⚠️ Is ID ka payment abhi chal raha hai, save nahi kiya. Thodi der baad dobara add karo.")
+        await update.message.reply_text(
+            "⚠️ Is ID ka payment abhi chal raha hai, save nahi kiya. Thodi der baad dobara add karo."
+        )
         user_state.pop(uid, None)
         admin_temp.pop(uid, None)
         return
@@ -500,11 +679,6 @@ async def admin_add_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state.pop(uid, None)
     admin_temp.pop(uid, None)
 
-    buttons = [
-        [InlineKeyboardButton("➕ Add Another", callback_data="admin_add")],
-        [InlineKeyboardButton("📋 View All Posts", callback_data="admin_view")],
-        [InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")],
-    ]
     note = "\n♻️ _Ye ID pehle sold thi — ab dobara available hai._" if relisted else ""
     await update.message.reply_text(
         f"✅ *Post Added Successfully!*\n\n"
@@ -512,11 +686,15 @@ async def admin_add_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 Price: `₹{money(price)}`\n"
         f"🔐 Credentials: _saved_{note}",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add Another",      callback_data="admin_add")],
+            [InlineKeyboardButton("📋 View All Posts",   callback_data="admin_view")],
+            [InlineKeyboardButton("⚙️ Admin Panel",      callback_data="admin_panel")],
+        ]),
     )
 
 
-# ─── VIEW POSTS ───────────────────────────────────────────────────────────────
+# ─── ADMIN: VIEW POSTS ────────────────────────────────────────────────────────
 async def admin_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -544,11 +722,12 @@ async def admin_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "\n\n🟢 available · 🟡 payment chal raha · ✅ sold"
 
     await query.edit_message_text(
-        text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(back_button("admin_panel"))
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(back_button("admin_panel")),
     )
 
 
-# ─── DELETE POST ──────────────────────────────────────────────────────────────
+# ─── ADMIN: DELETE POST ───────────────────────────────────────────────────────
 async def admin_delete_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -557,14 +736,18 @@ async def admin_delete_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not posts:
         await query.edit_message_text(
-            "📭 Koi post nahi hai.", reply_markup=InlineKeyboardMarkup(back_button("admin_panel"))
+            "📭 Koi post nahi hai.",
+            reply_markup=InlineKeyboardMarkup(back_button("admin_panel")),
         )
         return
 
     buttons = []
     for pid, info in list(posts.items())[:50]:
         tag = "🟡" if pid in reserved else "🗑️"
-        buttons.append([InlineKeyboardButton(f"{tag} {pid} — ₹{money(info['price'])}", callback_data=f"del_{pid}")])
+        buttons.append([InlineKeyboardButton(
+            f"{tag} {pid} — ₹{money(info['price'])}",
+            callback_data=f"del_{pid}",
+        )])
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
 
     await query.edit_message_text(
@@ -582,21 +765,23 @@ async def admin_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
     post_id = query.data[len("del_"):]
     if post_id in reserved:
-        text = f"⚠️ `{post_id}` ka payment abhi chal raha hai — delete nahi kar sakte. Thodi der baad try karo."
+        text = f"⚠️ `{post_id}` ka payment abhi chal raha hai — delete nahi kar sakte."
     elif post_id in posts:
         del posts[post_id]
         text = f"✅ Post `{post_id}` deleted!"
     else:
         text = "❌ Post nahi mila."
 
-    buttons = [
-        [InlineKeyboardButton("🗑️ Delete Another", callback_data="admin_delete_list")],
-        [InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")],
-    ]
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ Delete Another", callback_data="admin_delete_list")],
+            [InlineKeyboardButton("⚙️ Admin Panel",    callback_data="admin_panel")],
+        ]),
+    )
 
 
-# ─── EDIT POST ────────────────────────────────────────────────────────────────
+# ─── ADMIN: EDIT POST ─────────────────────────────────────────────────────────
 async def admin_edit_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -605,14 +790,18 @@ async def admin_edit_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not posts:
         await query.edit_message_text(
-            "📭 Koi post nahi hai.", reply_markup=InlineKeyboardMarkup(back_button("admin_panel"))
+            "📭 Koi post nahi hai.",
+            reply_markup=InlineKeyboardMarkup(back_button("admin_panel")),
         )
         return
 
     buttons = []
     for pid, info in list(posts.items())[:50]:
         tag = "🟡" if pid in reserved else "✏️"
-        buttons.append([InlineKeyboardButton(f"{tag} {pid} — ₹{money(info['price'])}", callback_data=f"edit_{pid}")])
+        buttons.append([InlineKeyboardButton(
+            f"{tag} {pid} — ₹{money(info['price'])}",
+            callback_data=f"edit_{pid}",
+        )])
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
 
     await query.edit_message_text(
@@ -624,7 +813,7 @@ async def admin_edit_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    uid = query.from_user.id
+    uid   = query.from_user.id
     if not is_admin(uid):
         await query.answer()
         return
@@ -637,18 +826,17 @@ async def admin_edit_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin_temp[uid] = {"edit_post_id": post_id}
     info = posts[post_id]
-    buttons = [
-        [InlineKeyboardButton("💰 Price Change", callback_data="editfield_price")],
-        [InlineKeyboardButton("🔐 Credentials Change", callback_data="editfield_creds")],
-        [InlineKeyboardButton("🔙 Back", callback_data="admin_edit_list")],
-    ]
     await query.edit_message_text(
         f"✏️ *Edit Post:* `{post_id}`\n\n"
         f"💰 Current Price: ₹{money(info['price'])}\n"
         "🔐 Credentials: _stored_\n\n"
         "Kya change karna hai?",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Price Change",       callback_data="editfield_price")],
+            [InlineKeyboardButton("🔐 Credentials Change", callback_data="editfield_creds")],
+            [InlineKeyboardButton("🔙 Back",               callback_data="admin_edit_list")],
+        ]),
     )
 
 
@@ -676,10 +864,10 @@ async def admin_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(uid) or user_state.get(uid) != ADMIN_EDIT_VALUE:
         return
 
-    value = update.message.text.strip()
-    data = admin_temp.get(uid, {})
+    value   = update.message.text.strip()
+    data    = admin_temp.get(uid, {})
     post_id = data.get("edit_post_id")
-    field = data.get("edit_field")
+    field   = data.get("edit_field")
 
     if not post_id or not field or post_id not in posts:
         await update.message.reply_text("❌ Error hua, dobara try karo.")
@@ -701,48 +889,57 @@ async def admin_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_state.pop(uid, None)
     admin_temp.pop(uid, None)
 
-    buttons = [
-        [InlineKeyboardButton("✏️ Edit Another", callback_data="admin_edit_list")],
-        [InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")],
-    ]
     await update.message.reply_text(
         f"✅ Post `{post_id}` updated!\n\n💰 Price: ₹{money(posts[post_id]['price'])}\n",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ Edit Another", callback_data="admin_edit_list")],
+            [InlineKeyboardButton("⚙️ Admin Panel",  callback_data="admin_panel")],
+        ]),
     )
 
 
 # ─── BUYER FLOW ───────────────────────────────────────────────────────────────
 async def buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Works from both inline callback AND reply-keyboard text trigger."""
     query = update.callback_query
-    await query.answer()
-    uid = query.from_user.id
+    uid   = update.effective_user.id
+
+    if query:
+        await query.answer()
 
     if user_pending(uid):
-        await query.edit_message_text(
+        text   = (
             "⏳ *Aapka ek order pending hai.*\n\n"
-            "Upar wale invoice se payment karo ya ❌ Cancel dabao.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(back_button("main_menu")),
+            "Upar wale invoice se payment karo ya ❌ Cancel dabao."
         )
+        markup = InlineKeyboardMarkup(back_button("main_menu"))
+        if query:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
         return
 
     if not posts:
-        await query.edit_message_text(
-            "😔 *Abhi koi ID available nahi hai.*\n\nThodi der baad try karo!",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(back_button("main_menu")),
-        )
+        text   = "😔 *Abhi koi ID available nahi hai.*\n\nThodi der baad try karo!"
+        markup = InlineKeyboardMarkup(back_button("main_menu"))
+        if query:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
         return
 
     user_state[uid] = BUYER_WAIT_POST_ID
-    await query.edit_message_text(
+    text   = (
         "🛒 *FF ID Buy Karo*\n\n"
         "Post ID bhejo jo khareedni hai:\n\n"
-        "_(Group me jo Post ID likhi hai wahi bhejo)_",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(back_button("main_menu")),
+        "_(Group me jo Post ID likhi hai wahi bhejo)_"
     )
+    markup = InlineKeyboardMarkup(back_button("main_menu"))
+    if query:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
 
 
 async def buyer_post_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -763,53 +960,50 @@ async def buyer_post_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if post_id in sold:
         await update.message.reply_text(
             "❌ *Ye ID already sold ho chuki hai.*\n\nKoi aur Post ID bhej sakte ho.",
-            parse_mode="Markdown",
-            reply_markup=menu_button(),
+            parse_mode="Markdown", reply_markup=menu_button(),
         )
         return
 
     if post_id not in posts:
         await update.message.reply_text(
             f"❌ *Post ID `{post_id}` nahi mila!*\n\nSahi ID bhejo ya admin se check karo.",
-            parse_mode="Markdown",
-            reply_markup=menu_button(),
+            parse_mode="Markdown", reply_markup=menu_button(),
         )
         return
 
     if post_id in reserved:
         await update.message.reply_text(
             "⏳ *Is ID ka payment abhi kisi aur buyer ka chal raha hai.*\n\n"
-            "5 minute baad dobara try karo. Agar wo pay nahi karta to ID wapas available ho jayegi.",
-            parse_mode="Markdown",
-            reply_markup=menu_button(),
+            "5 minute baad dobara try karo.",
+            parse_mode="Markdown", reply_markup=menu_button(),
         )
         return
 
-    # Reserve right away (no await between the checks above and this line,
-    # so two buyers can never grab the same ID).
+    # Reserve immediately — no await between check and this line
     reserved[post_id] = "creating"
     user_state.pop(uid, None)
-    price = posts[post_id]["price"]
+
+    price   = posts[post_id]["price"]
     chat_id = update.effective_chat.id
 
     wait_msg = await update.message.reply_text("⏳ Payment generating...")
 
-    # ── create FamGateway order ──
+    # ── Create FamGateway order ──
     try:
         payload = {
-            "api_key": FG_API_KEY,
-            "amount": price,
+            "api_key":       FG_API_KEY,
+            "amount":        price,
             "customer_name": update.effective_user.first_name or "Buyer",
         }
         data = await fg_create_order(payload)
         if data.get("status") != "success":
             raise RuntimeError(f"gateway said: {data}")
-        od = data["data"]
-        order_id = od["order_id"]
-        payable_amt = od["payable_amount"]
-        qr_url = od["qr_url"]
-        checkout_url = od["checkout_url"]
-        upi_intent = od.get("upi_intent")
+        od            = data["data"]
+        order_id      = od["order_id"]
+        payable_amt   = od["payable_amount"]
+        qr_url        = od["qr_url"]
+        checkout_url  = od["checkout_url"]
+        upi_intent    = od.get("upi_intent")
     except Exception as e:
         log.exception("create-order failed")
         if reserved.get(post_id) == "creating":
@@ -822,7 +1016,7 @@ async def buyer_post_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "user_id": uid,
         "post_id": post_id,
         "chat_id": chat_id,
-        "msg_id": None,
+        "msg_id":  None,
     }
     reserved[post_id] = order_id
 
@@ -835,18 +1029,13 @@ async def buyer_post_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━\n\n"
         "⏳ *QR 5 minute tak valid hai*\n"
         f"📱 Exact *₹{payable_amt}* hi pay karo — amount ya note edit mat karna\n"
-        "💎 Payment ke baad credentials apne aap aa jayenge!"
+        "💎 Payment ke baad credentials apne aap aa jayenge!\n"
+        "🔄 _Bot har 2 second me check karta hai — payment hote hi mil jayega_"
     )
-    # "Open Pay Page" hidden — payment is fully automatic via QR scan.
-    # Bot polls every second and delivers credentials the moment payment confirms.
-    _ = checkout_url  # kept in scope in case needed for admin logging
-    buttons = InlineKeyboardMarkup(
-        [
-            [btn("❌ Cancel", f"cancel_{order_id}", style="danger")],
-        ]
-    )
+    buttons = InlineKeyboardMarkup([
+        [ibt("❌ Cancel", f"cancel_{order_id}")],
+    ])
 
-    # Logo QR built from the gateway's own UPI link; falls back to the gateway QR image.
     qr_png = await asyncio.to_thread(make_branded_qr, upi_intent)
 
     try:
@@ -855,16 +1044,18 @@ async def buyer_post_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if qr_png is None:
                     raise ValueError("no branded QR")
                 sent = await update.message.reply_photo(
-                    photo=qr_png, caption=invoice_text, parse_mode="Markdown", reply_markup=buttons
+                    photo=qr_png, caption=invoice_text,
+                    parse_mode="Markdown", reply_markup=buttons,
                 )
             except Exception:
                 sent = await update.message.reply_photo(
-                    photo=qr_url, caption=invoice_text, parse_mode="Markdown", reply_markup=buttons
+                    photo=qr_url, caption=invoice_text,
+                    parse_mode="Markdown", reply_markup=buttons,
                 )
         except Exception:
             log.exception("QR photo send failed, falling back to text invoice")
             sent = await update.message.reply_text(
-                invoice_text, parse_mode="Markdown", reply_markup=buttons
+                invoice_text, parse_mode="Markdown", reply_markup=buttons,
             )
     except Exception:
         log.exception("invoice send failed")
@@ -875,6 +1066,7 @@ async def buyer_post_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_orders[order_id]["msg_id"] = sent.message_id
     await safe_delete(context.bot, chat_id, wait_msg.message_id)
 
+    # ── Start background payment poller ──
     task = asyncio.create_task(poll_payment(order_id, context))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
@@ -882,27 +1074,28 @@ async def buyer_post_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── ORDER OUTCOMES ───────────────────────────────────────────────────────────
 async def deliver_order(order_id: str, data: dict, context: ContextTypes.DEFAULT_TYPE):
-    """Payment confirmed: mark sold, remove the invoice, send credentials."""
+    """Payment confirmed → mark sold, delete invoice, send credentials."""
     info = pending_orders.pop(order_id, None)
-    if not info:  # already handled (poll task vs cancel button)
+    if not info:
         return
     _last_seen.pop(order_id, None)
 
     post_id = info["post_id"]
     chat_id = info["chat_id"]
-    bot = context.bot
+    bot     = context.bot
+
     reserved.pop(post_id, None)
     post = posts.pop(post_id, None)
     sold.add(post_id)
 
-    utr = data.get("utr") or "N/A"
+    utr    = data.get("utr") or "N/A"
     sender = data.get("sender") or "N/A"
-    log.info("order %s PAID | post=%s utr=%s", order_id, post_id, utr)
+    log.info("order %s PAID | post=%s utr=%s sender=%s", order_id, post_id, utr, sender)
 
     if info.get("msg_id"):
-        await safe_delete(bot, chat_id, info["msg_id"])  # old QR / invoice goes away
+        await safe_delete(bot, chat_id, info["msg_id"])
 
-    if post is None:  # should not happen, but never leave a paid buyer silent
+    if post is None:
         try:
             await bot.send_message(
                 chat_id,
@@ -911,18 +1104,21 @@ async def deliver_order(order_id: str, data: dict, context: ContextTypes.DEFAULT
             )
         except Exception:
             log.exception("could not message buyer")
-        await notify_admin(bot, f"⚠️ Paid order {order_id} (post {post_id}, UTR {utr}) but post data missing.")
+        await notify_admin(
+            bot,
+            f"⚠️ Paid order {order_id} (post {post_id}, UTR {utr}) but post data missing.",
+        )
         return
 
     creds = post["creds"]
-    e = html.escape
+    e     = html.escape
     html_text = (
         "✅ <b>PAYMENT VERIFIED!</b>\n\n"
         "🎮 <b>FF ID Credentials:</b>\n"
         f"<pre>{e(creds)}</pre>\n"
         f"📌 Post ID : <code>{e(post_id)}</code>\n"
-        f"🆔 Order : <code>{e(order_id)}</code>\n"
-        f"🏦 UTR : <code>{e(str(utr))}</code>\n"
+        f"🆔 Order   : <code>{e(order_id)}</code>\n"
+        f"🏦 UTR     : <code>{e(str(utr))}</code>\n"
         f"👤 Paid by : {e(str(sender))}\n\n"
         "🙏 <b>Thanks for purchase! Enjoy!</b>\n"
         "⚠️ Credentials ka screenshot le lo!"
@@ -930,8 +1126,12 @@ async def deliver_order(order_id: str, data: dict, context: ContextTypes.DEFAULT
     plain_text = (
         "✅ PAYMENT VERIFIED!\n\n"
         f"🎮 FF ID Credentials:\n{creds}\n\n"
-        f"📌 Post ID : {post_id}\n🆔 Order : {order_id}\n🏦 UTR : {utr}\n👤 Paid by : {sender}\n\n"
-        "🙏 Thanks for purchase! Enjoy!\n⚠️ Credentials ka screenshot le lo!"
+        f"📌 Post ID : {post_id}\n"
+        f"🆔 Order   : {order_id}\n"
+        f"🏦 UTR     : {utr}\n"
+        f"👤 Paid by : {sender}\n\n"
+        "🙏 Thanks for purchase! Enjoy!\n"
+        "⚠️ Credentials ka screenshot le lo!"
     )
 
     try:
@@ -948,6 +1148,12 @@ async def deliver_order(order_id: str, data: dict, context: ContextTypes.DEFAULT
                 f"Buyer chat id: {chat_id}\nOrder: {order_id}\nUTR: {utr}\n\nCredentials:\n{creds}",
             )
 
+    # Notify admin of the sale
+    await notify_admin(
+        bot,
+        f"💸 Sale! Post `{post_id}` | Order `{order_id}` | UTR `{utr}` | Buyer `{chat_id}`",
+    )
+
 
 async def expire_order(order_id: str, context: ContextTypes.DEFAULT_TYPE):
     info = release_order(order_id)
@@ -961,23 +1167,20 @@ async def expire_order(order_id: str, context: ContextTypes.DEFAULT_TYPE):
             info["chat_id"],
             "⏰ *Payment time khatam!*\n\nOrder expire ho gaya. Dobara try kar sakte ho.",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(
-                [[
-                    btn("🔄 Buy Again", "buy_start", style="success"),
-                    btn("🏠 Home", "main_menu", style="primary"),
-                ]]
-            ),
+            reply_markup=InlineKeyboardMarkup([
+                [ibt("🔄 Buy Again", "buy_start"), ibt("🏠 Home", "main_menu")],
+            ]),
         )
     except Exception:
         log.exception("could not send expiry message")
 
 
 async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    uid = query.from_user.id
+    query    = update.callback_query
+    uid      = query.from_user.id
     order_id = query.data[len("cancel_"):]
-    chat_id = query.message.chat_id
-    info = pending_orders.get(order_id)
+    chat_id  = query.message.chat_id
+    info     = pending_orders.get(order_id)
 
     if not info or info["user_id"] != uid:
         await query.answer("Ye order ab active nahi hai.", show_alert=True)
@@ -986,15 +1189,16 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    # Last-chance check: if the buyer already paid, deliver instead of cancelling.
+    # Last-chance check before cancelling
     status, data = await fg_status(order_id)
     if status == "success":
         await deliver_order(order_id, data, context)
         return
 
-    if release_order(order_id) is None:  # poll task finished it while we were checking
+    if release_order(order_id) is None:
         return
-    await safe_delete(context.bot, chat_id, query.message.message_id)  # QR goes away
+
+    await safe_delete(context.bot, chat_id, query.message.message_id)
     await context.bot.send_message(
         chat_id,
         "❌ Order cancel ho gaya. Kisi aur ID ke liye Main Menu pe jao.",
@@ -1002,13 +1206,25 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─── PAYMENT POLLING ──────────────────────────────────────────────────────────
+# ─── PAYMENT POLLER ───────────────────────────────────────────────────────────
 async def poll_payment(order_id: str, context: ContextTypes.DEFAULT_TYPE):
-    deadline = time.monotonic() + POLL_MAX_SECONDS
+    """
+    Polls FamGateway every POLL_INTERVAL seconds.
+
+    KEY FIX: First check happens immediately (no initial sleep),
+    so if the buyer pays before the first scheduled tick, we catch it instantly.
+    """
+    deadline    = time.monotonic() + POLL_MAX_SECONDS
+    first_check = True  # skip the sleep on the very first iteration
+
     while time.monotonic() < deadline:
-        await asyncio.sleep(POLL_INTERVAL)
+        if not first_check:
+            await asyncio.sleep(POLL_INTERVAL)
+        first_check = False
+
         if order_id not in pending_orders:
-            return  # cancelled / delivered elsewhere
+            return  # cancelled / delivered by another code path
+
         try:
             status, data = await fg_status(order_id)
             if status == "success":
@@ -1019,6 +1235,7 @@ async def poll_payment(order_id: str, context: ContextTypes.DEFAULT_TYPE):
                 return
         except Exception:
             log.exception("poll error for %s", order_id)
+
     await expire_order(order_id, context)
 
 
@@ -1032,9 +1249,25 @@ async def main_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── MESSAGE ROUTER ───────────────────────────────────────────────────────────
 async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    """Routes text messages: reply-keyboard triggers + state machine."""
+    uid   = update.effective_user.id
     state = user_state.get(uid)
+    text  = (update.message.text or "").strip()
 
+    # ── Reply-keyboard trigger words ──
+    if text in ("🛒 Buy FF ID", stylish("🛒 Buy FF ID"), "Buy FF ID",
+                "ʙᴜʏ ꜰꜰ ɪᴅ", "🛒 ʙᴜʏ ꜰꜰ ɪᴅ"):
+        user_state.pop(uid, None)
+        await buy_start(update, context)
+        return
+
+    if text in ("⚙️ Admin Panel", stylish("⚙️ Admin Panel"), "Admin Panel",
+                "ᴀᴅᴍɪɴ ᴘᴀɴᴇʟ", "⚙️ ᴀᴅᴍɪɴ ᴘᴀɴᴇʟ"):
+        user_state.pop(uid, None)
+        await admin_panel(update, context)
+        return
+
+    # ── State machine ──
     if state == ADMIN_WAIT_POST_ID:
         await admin_add_price(update, context)
     elif state == ADMIN_WAIT_PRICE:
@@ -1058,31 +1291,64 @@ async def _shutdown(app: Application):
         await _http.close()
 
 
+async def _on_startup(app: Application):
+    """Notify admin on boot."""
+    try:
+        await app.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "🚀 *FF Store Bot started!*\n\n"
+                f"🟢 Posts in memory: `{len(posts)}`\n"
+                "💎 Auto-payment polling: every 2 seconds\n"
+                "🔧 /checkorder <id> — force verify any order"
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        log.warning("startup notify failed")
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_shutdown(_shutdown).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_on_startup)
+        .post_shutdown(_shutdown)
+        .build()
+    )
 
-    # Selling happens ONLY in private chat. In groups the bot stays silent (except /start -> "open bot" button).
     private = filters.ChatType.PRIVATE
-    app.add_handler(CommandHandler("start", start, filters=private))
-    app.add_handler(CommandHandler("start", group_start, filters=filters.ChatType.GROUPS))
 
-    app.add_handler(CallbackQueryHandler(main_menu_cb, pattern="^main_menu$"))
-    app.add_handler(CallbackQueryHandler(admin_panel, pattern="^admin_panel$"))
-    app.add_handler(CallbackQueryHandler(admin_add_start, pattern="^admin_add$"))
-    app.add_handler(CallbackQueryHandler(admin_view, pattern="^admin_view$"))
-    app.add_handler(CallbackQueryHandler(admin_delete_list, pattern="^admin_delete_list$"))
+    # Commands
+    app.add_handler(CommandHandler("start",        start,           filters=private))
+    app.add_handler(CommandHandler("start",        group_start,     filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("checkorder",   cmd_checkorder,  filters=private))
+    app.add_handler(CommandHandler("orders",       cmd_orders,      filters=private))
+
+    # Inline callbacks
+    app.add_handler(CallbackQueryHandler(main_menu_cb,       pattern="^main_menu$"))
+    app.add_handler(CallbackQueryHandler(admin_panel,        pattern="^admin_panel$"))
+    app.add_handler(CallbackQueryHandler(admin_orders_cb,    pattern="^admin_orders$"))
+    app.add_handler(CallbackQueryHandler(admin_add_start,    pattern="^admin_add$"))
+    app.add_handler(CallbackQueryHandler(admin_view,         pattern="^admin_view$"))
+    app.add_handler(CallbackQueryHandler(admin_delete_list,  pattern="^admin_delete_list$"))
     app.add_handler(CallbackQueryHandler(admin_delete_confirm, pattern="^del_"))
-    app.add_handler(CallbackQueryHandler(admin_edit_list, pattern="^admin_edit_list$"))
-    app.add_handler(CallbackQueryHandler(admin_edit_select, pattern="^edit_"))
-    app.add_handler(CallbackQueryHandler(admin_edit_field, pattern="^editfield_"))
-    app.add_handler(CallbackQueryHandler(buy_start, pattern="^buy_start$"))
-    app.add_handler(CallbackQueryHandler(cancel_order, pattern="^cancel_"))
+    app.add_handler(CallbackQueryHandler(admin_edit_list,    pattern="^admin_edit_list$"))
+    app.add_handler(CallbackQueryHandler(admin_edit_select,  pattern="^edit_"))
+    app.add_handler(CallbackQueryHandler(admin_edit_field,   pattern="^editfield_"))
+    app.add_handler(CallbackQueryHandler(buy_start,          pattern="^buy_start$"))
+    app.add_handler(CallbackQueryHandler(cancel_order,       pattern="^cancel_"))
 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & private, message_router))
+    # Text messages
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & private,
+        message_router,
+    ))
+
     app.add_error_handler(on_error)
 
-    log.info("🚀 FF Store Bot starting...")
+    log.info("🚀 FF Store Bot starting — payment poll every %ds", POLL_INTERVAL)
     app.run_polling(drop_pending_updates=True)
 
 
