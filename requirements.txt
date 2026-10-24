@@ -1,4 +1,5 @@
-python-telegram-bot>=22.8
+python-telegram-bot>=22.6
 aiohttp
 qrcode[pil]
-Pillow
+pillow
+cryptography
